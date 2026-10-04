@@ -1,0 +1,69 @@
+# Reusable I2C / MCP23017 diagnostics — YAML glue for mcp_tools.h
+#
+# Provides SCRIPTS ONLY. Buttons live in the project file, because how many
+# MCPs you have and at which addresses is project specific.
+#
+# In the project file:
+#
+#   esphome:
+#     includes:
+#       - mcp_tools/mcp_tools.h   # the C++ lives here
+#
+#   packages:
+#     mcp_tools: !include
+#       file: mcp_tools/mcp_tools.yaml
+#       vars:
+#         i2c_id: bus_i2c      # id of your i2c: bus
+#
+# Then declare one button per chip — they are just calls:
+#
+#   button:
+#     - platform: template
+#       name: "Dump MCP 0x20"
+#       entity_category: "diagnostic"
+#       on_press:
+#         - script.execute:
+#             id: dump_mcp23017_registers
+#             addr: 0x20
+#     - platform: template
+#       name: "Dump MCP 0x21"
+#       entity_category: "diagnostic"
+#       on_press:
+#         - script.execute:
+#             id: dump_mcp23017_registers
+#             addr: 0x21
+#     # ...0x22, 0x23, and so on
+#     - platform: template
+#       name: "I2C Bus Scan"
+#       entity_category: "diagnostic"
+#       on_press:
+#         - script.execute: i2c_bus_scan
+#
+# Both files are project agnostic; share them as a git submodule.
+#
+# Provides:
+#   script  dump_mcp23017_registers(addr)   full register dump of any MCP23017
+#   script  i2c_bus_scan                    probe 0x08..0x77
+#   C++     mcp_tools::health().check_all(bus, detail, {addrs})  register health
+#           (IPOL, IODIR/IOCON drift, output readback); default addrs {0x20}
+
+substitutions:
+  i2c_id: bus_i2c
+
+script:
+  # mode: queued so that mashing several dump buttons in a row runs all of
+  # them in sequence instead of silently dropping the later presses.
+  - id: dump_mcp23017_registers
+    mode: queued
+    max_runs: 8
+    parameters:
+      addr: int
+    then:
+      - lambda: |-
+          mcp_tools::dump_mcp23017(id(${i2c_id}), (uint8_t) addr);
+
+  - id: i2c_bus_scan
+    mode: single
+    then:
+      - lambda: |-
+          mcp_tools::i2c_scan(id(${i2c_id}));
