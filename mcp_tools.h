@@ -149,6 +149,26 @@ inline int i2c_scan(esphome::i2c::I2CBus *bus) {
 
 static const char *const TAG_HEALTH = "mcp_health";
 
+// Register health monitor.
+//
+// Two kinds of check:
+//
+//   ABSOLUTE INVARIANTS - true of any healthy MCP23017, whatever the project:
+//     * IOCON is ONE physical register mirrored at 0x0A and 0x0B. Reading two
+//       different values from it is impossible on working silicon. This is the
+//       check that identified a chip which had looked merely "flaky" for weeks.
+//     * IPOL must be 0: ESPHome inverts in software, and a stray 0xFF here
+//       silently reports every input as its opposite.
+//     * DEFVAL/OLAT left non-zero on an input-only port means something wrote
+//       a register nothing should be writing - a corrupted transaction.
+//
+//   DRIFT FROM BASELINE - IODIR, GPPU, GPINTEN and IOCON are captured on first
+//     sight and compared from then on, so no project-specific expected values
+//     need to be configured.
+//
+// Note the baseline's weakness: if a chip is already in a bad state at the
+// first check, that state becomes the reference. The absolute invariants above
+// have no such blind spot, which is why both kinds exist.
 class McpHealth {
  public:
   // One chip. Appends "0xNN:<issues> " to detail; true if anomalous.
@@ -156,20 +176,32 @@ class McpHealth {
     Chip &c = chips_[addr];
     Regs r;
     std::string issues;
-    char buf[64];
+    char buf[80];
     if (!read_(bus, addr, r)) {
       issues = "NACK ";
     } else {
       if (!c.seen) {
         c.seen = true;
         c.base = r;
-        ESP_LOGI(TAG_HEALTH, "0x%02X baseline IODIR A=%02X B=%02X IOCON=%02X",
-                 addr, r.iodir_a, r.iodir_b, r.iocon);
+        ESP_LOGI(TAG_HEALTH, "0x%02X baseline IODIR A=%02X B=%02X IOCON=%02X GPPU A=%02X B=%02X",
+                 addr, r.iodir_a, r.iodir_b, r.iocon, r.gppu_a, r.gppu_b);
+      }
+
+      // --- absolute invariants ---
+      if (r.iocon != r.iocon_b) {
+        snprintf(buf, sizeof(buf), "IOCON MIRROR %02X!=%02X ", r.iocon, r.iocon_b);
+        issues += buf;  // same physical register: a split means damaged silicon
       }
       if (r.ipol_a || r.ipol_b) {
         snprintf(buf, sizeof(buf), "IPOL A=%02X,B=%02X ", r.ipol_a, r.ipol_b);
         issues += buf;
       }
+      if (r.defval_a || r.defval_b) {
+        snprintf(buf, sizeof(buf), "DEFVAL A=%02X,B=%02X ", r.defval_a, r.defval_b);
+        issues += buf;  // never written by ESPHome: indicates a stray write
+      }
+
+      // --- drift from baseline ---
       if (r.iodir_a != c.base.iodir_a || r.iodir_b != c.base.iodir_b) {
         snprintf(buf, sizeof(buf), "IODIR A=%02X>%02X,B=%02X>%02X ",
                  c.base.iodir_a, r.iodir_a, c.base.iodir_b, r.iodir_b);
@@ -179,6 +211,17 @@ class McpHealth {
         snprintf(buf, sizeof(buf), "IOCON %02X>%02X ", c.base.iocon, r.iocon);
         issues += buf;
       }
+      if (r.gppu_a != c.base.gppu_a || r.gppu_b != c.base.gppu_b) {
+        snprintf(buf, sizeof(buf), "GPPU A=%02X>%02X,B=%02X>%02X ",
+                 c.base.gppu_a, r.gppu_a, c.base.gppu_b, r.gppu_b);
+        issues += buf;
+      }
+      if (r.gpinten_a != c.base.gpinten_a || r.gpinten_b != c.base.gpinten_b) {
+        snprintf(buf, sizeof(buf), "GPINTEN A=%02X>%02X,B=%02X>%02X ",
+                 c.base.gpinten_a, r.gpinten_a, c.base.gpinten_b, r.gpinten_b);
+        issues += buf;  // a bit that will not take a write is a damaged register
+      }
+
       // output pins (IODIR=0): real pin level must match the latch
       const uint8_t bad_a = (uint8_t) (~r.iodir_a & (r.gpio_a ^ r.ipol_a ^ r.olat_a));
       const uint8_t bad_b = (uint8_t) (~r.iodir_b & (r.gpio_b ^ r.ipol_b ^ r.olat_b));
@@ -211,9 +254,83 @@ class McpHealth {
     return dirty;
   }
 
+  // Is the GPIO register still sampling, or stuck? Reads twice and reports
+  // whether anything moved. Informational: genuinely static inputs also read
+  // stable, so this is a hint, not a verdict.
+  bool gpio_moving(esphome::i2c::I2CBus *bus, uint8_t addr, uint32_t gap_ms = 2) {
+    uint8_t a1 = 0, b1 = 0, a2 = 0, b2 = 0;
+    esphome::i2c::I2CDevice dev;
+    dev.set_i2c_bus(bus);
+    dev.set_i2c_address(addr);
+    auto rd = [&dev](uint8_t reg, uint8_t &out) {
+      return dev.read_register(reg, &out, 1) == esphome::i2c::ERROR_OK;
+    };
+    if (!rd(0x12, a1) || !rd(0x13, b1)) return false;
+    delay(gap_ms);
+    if (!rd(0x12, a2) || !rd(0x13, b2)) return false;
+    ESP_LOGD(TAG_HEALTH, "0x%02X GPIO A=%02X/%02X B=%02X/%02X %s",
+             addr, a1, a2, b1, b2, (a1 == a2 && b1 == b2) ? "(stable)" : "(moving)");
+    return a1 != a2 || b1 != b2;
+  }
+
+  // Verify-and-repair. Rewrites only what drifted, then reads back to confirm.
+  // IPOL is forced to 0 (absolute invariant); the rest returns to the baseline.
+  // Returns how many registers had to be rewritten; a write that does not stick
+  // is logged as such, because that is the signature of real damage rather than
+  // a corrupted transaction.
+  //
+  // Writes only when something is wrong: on a marginal bus every extra
+  // transaction is itself a risk.
+  int repair(esphome::i2c::I2CBus *bus, uint8_t addr) {
+    Chip &c = chips_[addr];
+    if (!c.seen) return 0;  // no baseline yet, nothing to compare against
+    Regs r;
+    if (!read_(bus, addr, r)) return 0;
+
+    esphome::i2c::I2CDevice dev;
+    dev.set_i2c_bus(bus);
+    dev.set_i2c_address(addr);
+    auto rd = [&dev](uint8_t reg, uint8_t &out) {
+      return dev.read_register(reg, &out, 1) == esphome::i2c::ERROR_OK;
+    };
+    auto wr = [&dev](uint8_t reg, uint8_t v) {
+      return dev.write_register(reg, &v, 1) == esphome::i2c::ERROR_OK;
+    };
+
+    struct Fix { uint8_t reg; const char *name; uint8_t is, want; };
+    const Fix fixes[] = {
+        {0x02, "IPOLA", r.ipol_a, 0x00},
+        {0x03, "IPOLB", r.ipol_b, 0x00},
+        {0x00, "IODIRA", r.iodir_a, c.base.iodir_a},
+        {0x01, "IODIRB", r.iodir_b, c.base.iodir_b},
+        {0x0C, "GPPUA", r.gppu_a, c.base.gppu_a},
+        {0x0D, "GPPUB", r.gppu_b, c.base.gppu_b},
+        {0x0A, "IOCON", r.iocon, c.base.iocon},
+    };
+    int fixed = 0;
+    for (const auto &f : fixes) {
+      if (f.is == f.want) continue;
+      uint8_t back = 0;
+      const bool ok = wr(f.reg, f.want) && rd(f.reg, back) && back == f.want;
+      ESP_LOGW(TAG_HEALTH, "0x%02X %s was %02X, expected %02X -> %s", addr, f.name,
+               f.is, f.want, ok ? "REPAIRED" : "REPAIR FAILED (suspect hardware)");
+      fixed++;
+    }
+    return fixed;
+  }
+
+  int repair_all(esphome::i2c::I2CBus *bus, const std::vector<uint8_t> &addrs = {0x20}) {
+    int n = 0;
+    for (uint8_t addr : addrs)
+      n += repair(bus, addr);
+    return n;
+  }
+
  private:
   struct Regs {
-    uint8_t iodir_a, iodir_b, ipol_a, ipol_b, iocon, gpio_a, gpio_b, olat_a, olat_b;
+    uint8_t iodir_a, iodir_b, ipol_a, ipol_b, iocon, iocon_b;
+    uint8_t gpinten_a, gpinten_b, defval_a, defval_b, gppu_a, gppu_b;
+    uint8_t gpio_a, gpio_b, olat_a, olat_b;
   };
   struct Chip {
     bool seen = false;
@@ -230,8 +347,11 @@ class McpHealth {
       return dev.read_register(reg, &out, 1) == esphome::i2c::ERROR_OK;
     };
     return rd(0x00, r.iodir_a) && rd(0x01, r.iodir_b) && rd(0x02, r.ipol_a) &&
-           rd(0x03, r.ipol_b) && rd(0x0A, r.iocon) && rd(0x12, r.gpio_a) &&
-           rd(0x13, r.gpio_b) && rd(0x14, r.olat_a) && rd(0x15, r.olat_b);
+           rd(0x03, r.ipol_b) && rd(0x04, r.gpinten_a) && rd(0x05, r.gpinten_b) &&
+           rd(0x06, r.defval_a) && rd(0x07, r.defval_b) && rd(0x0A, r.iocon) &&
+           rd(0x0B, r.iocon_b) && rd(0x0C, r.gppu_a) && rd(0x0D, r.gppu_b) &&
+           rd(0x12, r.gpio_a) && rd(0x13, r.gpio_b) && rd(0x14, r.olat_a) &&
+           rd(0x15, r.olat_b);
   }
 };
 

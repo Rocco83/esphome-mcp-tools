@@ -44,11 +44,25 @@
 # Provides:
 #   script  dump_mcp23017_registers(addr)   full register dump of any MCP23017
 #   script  i2c_bus_scan                    probe 0x08..0x77
-#   C++     mcp_tools::health().check_all(bus, detail, {addrs})  register health
-#           (IPOL, IODIR/IOCON drift, output readback); default addrs {0x20}
+#   script  mcp_health_check                health of every chip in ${mcp_addrs}
+#   script  mcp_guard                       verify-and-repair of the same chips
+#   C++     mcp_tools::health().check_all(bus, detail, {addrs})
+#           mcp_tools::health().repair_all(bus, {addrs})
+#           mcp_tools::health().gpio_moving(bus, addr)
+#
+# Set mcp_addrs to the chips in your project, e.g.
+#
+#   packages:
+#     mcp_tools: !include
+#       file: mcp_tools/mcp_tools.yaml
+#       vars:
+#         i2c_id: bus_i2c
+#         mcp_addrs: "0x20, 0x21, 0x22, 0x23"
 
 substitutions:
   i2c_id: bus_i2c
+  # Chips the health check and the guard act on. Override per project.
+  mcp_addrs: "0x20"
 
 script:
   # mode: queued so that mashing several dump buttons in a row runs all of
@@ -67,3 +81,38 @@ script:
     then:
       - lambda: |-
           mcp_tools::i2c_scan(id(${i2c_id}));
+
+  # Health of every chip in ${mcp_addrs}. Absolute invariants (IOCON mirror,
+  # IPOL, DEFVAL) plus drift from the baseline captured on first run.
+  - id: mcp_health_check
+    mode: single
+    then:
+      - lambda: |-
+          std::string detail;
+          const bool dirty = mcp_tools::health().check_all(
+              id(${i2c_id}), detail, {${mcp_addrs}});
+          if (dirty) {
+            ESP_LOGE("mcp_health", "PROBLEMS: %s", detail.c_str());
+          } else {
+            // Spell out what "clean" actually covers, so a passing line in the
+            // log is not mistaken for "everything about the chip is fine".
+            ESP_LOGI("mcp_health", "clean - all chips answered, and on each:");
+            ESP_LOGI("mcp_health", "  IOCON mirror 0x0A == 0x0B   (one physical register)");
+            ESP_LOGI("mcp_health", "  IPOL = 0                    (no inverted inputs)");
+            ESP_LOGI("mcp_health", "  DEFVAL = 0                  (no stray writes)");
+            ESP_LOGI("mcp_health", "  IODIR/GPPU/GPINTEN/IOCON unchanged since baseline");
+            ESP_LOGI("mcp_health", "  output pins match OLAT      (drivers still driving)");
+            ESP_LOGI("mcp_health", "  NOT covered: whether GPIO still tracks the pins");
+          }
+
+  # Verify-and-repair. Rewrites only the registers that drifted, confirms the
+  # write stuck, and reports a write that did not - which is how real damage
+  # announces itself, as opposed to a corrupted transaction.
+  - id: mcp_guard
+    mode: single
+    then:
+      - lambda: |-
+          const int fixed = mcp_tools::health().repair_all(
+              id(${i2c_id}), {${mcp_addrs}});
+          if (fixed)
+            ESP_LOGW("mcp_health", "repaired %d register(s)", fixed);
